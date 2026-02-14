@@ -8,7 +8,8 @@ A CCXT-based Python application that monitors private trades and live orders via
 - **Local Data Management**: Maintains a rolling window of trades and order book snapshots.
 - **`verify_trades`**: Calculates total traded volume within the `compute_window`.
 - **`verify_orders`**: Calculates the distribution (quantiles) of open order sizes within specific price depths from the mid-price.
-- **Automated Reporting**: Sends metrics to a remote DB every `compute_window`.
+- **Automated Reporting**: Logs metrics to a CSV file every `compute_window`.
+- **Public vs Private Monitoring**: Includes both private account monitoring (`monitor.py`) and public market monitoring (`monitor_public.py`).
 
 ## Installation
 
@@ -40,9 +41,14 @@ Modify `config.yaml` to adjust:
 
 ## Usage
 
-Start the monitor:
+Start the private monitor:
 ```bash
 python monitor.py
+```
+
+Start the public monitor:
+```bash
+python monitor_public.py
 ```
 
 ## Logic Overview

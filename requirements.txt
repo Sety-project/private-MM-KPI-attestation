@@ -4,3 +4,4 @@ PyYAML
 pandas
 numpy
 aiohttp
+tenacity

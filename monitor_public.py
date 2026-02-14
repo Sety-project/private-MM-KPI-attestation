@@ -8,7 +8,6 @@ from datetime import datetime, timedelta, UTC
 import pandas as pd
 import numpy as np
 from collections import deque
-from dotenv import load_dotenv
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Set up logging
@@ -18,11 +17,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class DataStore:
+class PublicDataStore:
     def __init__(self, record_window_seconds):
         self.record_window = record_window_seconds
         self.trades = deque()  # Queue of dicts
-        self.orders = {}  # Dict of order_id: order_data
+        self.order_book = None  # Latest order book Snapshot
+        self.last_book_update = 0
         self.bbo_history = deque()  # Queue of (timestamp, bid, ask)
         self.last_activity = time.time() 
         self.connected = True # Proactive connection status
@@ -33,13 +33,10 @@ class DataStore:
         self.last_activity = time.time()
         self.prune()
 
-    def add_order(self, order):
-        # Update or add the order by its ID to keep track of latest status
-        order['received_at'] = time.time()
-        self.orders[order['id']] = order
+    def update_order_book(self, book):
+        self.order_book = book
+        self.last_book_update = time.time()
         self.last_activity = time.time()
-        # Note: We don't prune orders on every addition as it's a dict.
-        # Pruning is handled in the periodic prune call.
 
     def update_bbo(self, bid, ask):
         self.bbo_history.append({
@@ -61,23 +58,12 @@ class DataStore:
         while self.bbo_history and self.bbo_history[0]['timestamp'] < cutoff:
             self.bbo_history.popleft()
 
-        # Pruning the orders dict is more expensive, so we only do it if it grows large
-        # or less frequently. For now, let's do a simple cleanup.
-        if len(self.orders) > 1000:
-            expired_ids = [
-                oid for oid, o in self.orders.items() 
-                if o['received_at'] < cutoff and o['status'] != 'open'
-            ]
-            for oid in expired_ids:
-                del self.orders[oid]
-
     def get_trades_since(self, seconds):
         cutoff = time.time() - seconds
         return [t for t in self.trades if t['received_at'] > cutoff]
 
-class TradeMonitor:
-    def __init__(self, config_path='.env'):
-        load_dotenv(config_path)
+class PublicTradeMonitor:
+    def __init__(self):
         with open('config.yaml', 'r') as f:
             self.config = yaml.safe_load(f)
             
@@ -88,18 +74,18 @@ class TradeMonitor:
         self.compute_window = self.config['compute_window']
         self.record_window = self.config['record_window']
         
+        # Public monitoring might not need these, but we keep them just in case for higher rate limits
         self.api_key = os.getenv('API_KEY')
         self.secret_key = os.getenv('SECRET_KEY')
         
-        self.store = DataStore(self.record_window)
-        self.exchange = getattr(ccxtpro, self.exchange_id)({
-            'apiKey': self.api_key,
-            'secret': self.secret_key,
+        self.store = PublicDataStore(self.record_window)
+        
+        exchange_config = {
             'enableRateLimit': True,
-        })
+        }
+        self.exchange = getattr(ccxtpro, self.exchange_id)(exchange_config)
         
         # Internal state for tracking "total size within depth" history.
-        # We use a deque with maxlen for automatic circular pruning.
         self.order_size_history = {d: deque(maxlen=self.record_window) for d in self.depths}
 
     async def watch_with_retry(self, method_name, *args):
@@ -122,47 +108,59 @@ class TradeMonitor:
     def _handle_retry_failure(self, method_name, retry_state):
         logger.warning(f"Retrying {method_name} (Attempt {retry_state.attempt_number}/10) after error: {retry_state.outcome.exception()}")
         self.store.connected = False
-        
+
     async def watch_trades(self):
+        logger.info(f"Starting trade watcher for {self.symbol}")
+        first = True
         while True:
-            trades = await self.watch_with_retry('watch_my_trades', self.symbol)
+            trades = await self.watch_with_retry('watch_trades', self.symbol)
+            if first:
+                logger.info(f"Received first trade for {self.symbol}")
+                first = False
             for trade in trades:
-                logger.info(f"New trade: {trade['amount']} @ {trade['price']}")
                 self.store.add_trade(trade)
 
-    async def watch_orders(self):
+    async def watch_order_book(self):
+        logger.info(f"Starting order book watcher for {self.symbol}")
+        first = True
         while True:
-            orders = await self.watch_with_retry('watch_orders', self.symbol)
-            for order in orders:
-                self.store.add_order(order)
-
-    async def watch_bbo(self):
-        while True:
-            ticker = await self.watch_with_retry('watch_ticker', self.symbol)
-            bid = ticker['bid']
-            ask = ticker['ask']
-            if bid and ask:
-                self.store.update_bbo(bid, ask)
+            book = await self.watch_with_retry('watch_order_book', self.symbol)
+            if first:
+                logger.info(f"Received first order book snapshot for {self.symbol}")
+                first = False
+            self.store.update_order_book(book)
 
     async def sample_order_snapshots(self):
-        """Samples the current order sizes within depths for quantile calculation."""
+        """Samples the current order book sizes within depths every second for quantile calculation."""
         logger.info("Starting order book snapshot sampler")
         while True:
             try:
-                # Check for global link staleness
-                if time.time() - self.store.last_activity > 30:
-                    # If we haven't heard from the exchange at all for 30s, don't sample
-                    pass 
-                elif self.store.bbo_history:
-                    current_mid = self.store.bbo_history[-1]['mid']
-                    open_orders = [o for o in self.store.orders.values() if o['status'] == 'open']
+                if self.store.order_book:
+                    book = self.store.order_book
+                    bids = book['bids'] # [[price, amount], ...]
+                    asks = book['asks'] # [[price, amount], ...]
                     
-                    for d in self.depths:
-                        value_within_depth = sum(
-                            (o.get('remaining', o.get('amount', 0)) * o['price']) for o in open_orders
-                            if abs(o['price']/current_mid - 1) <= d*1e-4
-                        )
-                        self.order_size_history[d].append(value_within_depth)
+                    if bids and asks:
+                        # Link staleness check
+                        if time.time() - self.store.last_activity > 30:
+                            # Skip sampling if not heard from server
+                            pass
+                        else:
+                            best_bid = bids[0][0]
+                            best_ask = asks[0][0]
+                            current_mid = (best_bid + best_ask) / 2.0
+                        
+                        for d in self.depths:
+                            depth_ratio = d * 1e-4
+                            min_price = current_mid * (1 - depth_ratio)
+                            max_price = current_mid * (1 + depth_ratio)
+                            
+                            # Calculate value in quote currency (amount * price) for bids and asks within depth
+                            bid_value = sum(amount * price for price, amount in bids if price >= min_price)
+                            ask_value = sum(amount * price for price, amount in asks if price <= max_price)
+                            
+                            total_value_within_depth = bid_value + ask_value
+                            self.order_size_history[d].append(total_value_within_depth)
                 
                 await asyncio.sleep(1)
             except Exception as e:
@@ -176,23 +174,21 @@ class TradeMonitor:
 
         trades = self.store.get_trades_since(self.compute_window)
         total_volume = sum(t['amount'] * t['price'] for t in trades)
-        logger.info(f"Verify Trades: Total volume in last {self.compute_window}s: {total_volume}")
+        logger.info(f"Verify Public Trades: Collected {len(trades)} trades. Total volume in last {self.compute_window}s: {total_volume:.2f}")
         return total_volume
 
     def verify_orders(self):
         """
-        For each depth and quantile, computes the quantile of the total size of orders 
-        within depth of the avg of best bid and offer.
+        Computes the quantile of the total size of the order book 
+        within depth of the mid price.
         """
         if not self.store.connected or time.time() - self.store.last_activity > 15:
             logger.error("Connection is down or stale (>15s). Reporting STALE_DATA.")
             return {f"depth_{d}_q{q}": "STALE_DATA" for d in self.depths for q in self.quantiles}
 
-        if not self.store.bbo_history:
+        if not self.store.order_book:
             return {f"depth_{d}_q{q}": "NO_DATA" for d in self.depths for q in self.quantiles}
 
-        current_mid = self.store.bbo_history[-1]['mid']
-        
         results = {}
         for d in self.depths:
             data = np.array(self.order_size_history[d])
@@ -204,11 +200,11 @@ class TradeMonitor:
                 for q in self.quantiles:
                     results[f"depth_{d}_q{q}"] = "NO_SAMPLES"
                     
-        logger.info(f"Verify Orders Results: {results}")
+        logger.info(f"Verify Public Orders Results: {results}")
         return results
 
     async def save_to_csv(self, data):
-        filename = "results.csv"
+        filename = "results_public.csv"
         # Flatten the order_stats into the main dictionary
         row = {
             'start_ts': data['start_ts'],
@@ -225,16 +221,18 @@ class TradeMonitor:
         
         # Append to CSV
         df.to_csv(filename, mode='a', index=False, header=not file_exists)
-        logger.info(f"Saved results to {filename}")
+        logger.info(f"Saved public results to {filename}")
 
     async def scheduler(self):
         # Initialize the first window start
         window_start = datetime.now(UTC)
+        logger.info(f"Scheduler started. Window size: {self.compute_window}s")
         
         while True:
             await asyncio.sleep(self.compute_window)
             try:
                 window_end = datetime.now(UTC)
+                logger.info(f"Starting computation for window {window_start.isoformat()} to {window_end.isoformat()}")
                 volume = self.verify_trades()
                 order_stats = self.verify_orders()
                 
@@ -259,8 +257,7 @@ class TradeMonitor:
         try:
             await asyncio.gather(
                 self.watch_trades(),
-                self.watch_orders(),
-                self.watch_bbo(),
+                self.watch_order_book(),
                 self.sample_order_snapshots(),
                 self.scheduler()
             )
@@ -269,10 +266,8 @@ class TradeMonitor:
             logger.info("Exchange connection closed")
 
 if __name__ == "__main__":
-    monitor = TradeMonitor()
+    monitor = PublicTradeMonitor()
     try:
         asyncio.run(monitor.run())
     except KeyboardInterrupt:
         logger.info("Monitor stopped by user")
-    except Exception as e:
-        logger.critical(f"Monitor halted due to unrecoverable error: {e}")

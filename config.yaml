@@ -1,6 +1,6 @@
 exchange_name: binance
-symbol: BTC/USDT:USDT
+symbol: BTC/USDT
 depths: [25, 50, 100, 200]
 quantiles: [0.01, 0.05, 0.1, 0.5]
-compute_window: 60  # seconds
+compute_window: 10  # seconds
 record_window: 300  # 5 minutes
