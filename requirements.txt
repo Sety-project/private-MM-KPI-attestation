@@ -1,0 +1,6 @@
+ccxt
+python-dotenv
+PyYAML
+pandas
+numpy
+aiohttp
