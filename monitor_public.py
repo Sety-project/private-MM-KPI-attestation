@@ -10,6 +10,10 @@ import numpy as np
 from collections import deque
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+class ReconnectionError(Exception):
+    """Custom exception to signal a retry is needed after exchange re-init."""
+    pass
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -79,20 +83,28 @@ class PublicTradeMonitor:
         self.secret_key = os.getenv('SECRET_KEY')
         
         self.store = PublicDataStore(self.record_window)
-        
-        exchange_config = {
-            'enableRateLimit': True,
-        }
-        self.exchange = getattr(ccxtpro, self.exchange_id)(exchange_config)
+        self.reconnect_lock = asyncio.Lock()
+        self._init_exchange()
         
         # Internal state for tracking "total size within depth" history.
         self.order_size_history = {d: deque(maxlen=self.record_window) for d in self.depths}
+
+    def _init_exchange(self):
+        exchange_config = {
+            'enableRateLimit': True,
+        }
+        # In case we need keys for higher rate limits even for public data
+        if self.api_key and self.secret_key:
+            exchange_config['apiKey'] = self.api_key
+            exchange_config['secret'] = self.secret_key
+            
+        self.exchange = getattr(ccxtpro, self.exchange_id)(exchange_config)
 
     async def watch_with_retry(self, method_name, *args):
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(10),
             wait=wait_exponential(multiplier=1, min=1, max=60),
-            retry=retry_if_exception_type(Exception),
+            retry=retry_if_exception_type((Exception, ReconnectionError)),
             before_sleep=lambda retry_state: self._handle_retry_failure(method_name, retry_state)
         ):
             with attempt:
@@ -101,8 +113,25 @@ class PublicTradeMonitor:
                     data = await asyncio.wait_for(method(*args), timeout=30)
                     self.store.connected = True
                     return data
-                except Exception as e:
+                except (Exception, asyncio.CancelledError) as e:
                     self.store.connected = False
+                    
+                    # If this is a CancelledError, it might be because ANOTHER task 
+                    # called self.exchange.close() to reset the connection.
+                    error_type = type(e).__name__
+                    logger.error(f"Error in {method_name}: {error_type}. Re-initializing connection...")
+                    
+                    async with self.reconnect_lock:
+                        if method.__self__ is self.exchange:
+                            try:
+                                await self.exchange.close()
+                            except:
+                                pass
+                            self._init_exchange()
+                    
+                    if isinstance(e, asyncio.CancelledError):
+                        # Convert to an Exception so tenacity handles it
+                        raise ReconnectionError(f"Task cancelled in {method_name}") from e
                     raise e
 
     def _handle_retry_failure(self, method_name, retry_state):
